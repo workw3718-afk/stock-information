@@ -6,4 +6,4 @@ python-dotenv
 requests
 beautifulsoup4
 lxml
-openai<1.0.0
+openai==1.30.1
