@@ -32,7 +32,7 @@ def resolve_api_key(ui_key: str = "") -> str:
 
 def get_client(api_key: str) -> OpenAI:
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing. Add it in Streamlit Cloud Secrets or paste in sidebar.")
+        raise RuntimeError("OPENAI_API_KEY missing. Add in Streamlit Secrets or paste in sidebar.")
     return OpenAI(api_key=api_key)
 
 
@@ -377,15 +377,19 @@ You write Quora posts in English in a clean institutional tone. Concrete, measur
 
 
 # =============================
-# OpenAI calls
+# OpenAI calls (chat.completions)
 # =============================
 def call_gpt(api_key: str, model: str, system: str, user: str) -> str:
     client = get_client(api_key)
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=model,
-        input=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.8,
     )
-    return (getattr(resp, "output_text", "") or "").strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 def translate_text(api_key: str, model: str, text: str, target_lang: str) -> str:
@@ -397,11 +401,15 @@ def translate_text(api_key: str, model: str, text: str, target_lang: str) -> str
         "Preserve paragraph breaks exactly."
     )
     user = f"Translate to {target_lang}. Text:\n\n{text}"
-    resp = client.responses.create(
+    resp = client.chat.completions.create(
         model=model,
-        input=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
     )
-    return (getattr(resp, "output_text", "") or "").strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 def build_user_prompt(
@@ -464,7 +472,8 @@ with st.sidebar:
     api_key_ui = st.text_input("API Key (optional if Secrets has it)", value="", type="password")
     api_key = resolve_api_key(api_key_ui)
 
-    model = st.text_input("Model", value="gpt-4.1-mini")
+    # Safer default model for most accounts
+    model = st.text_input("Model", value="gpt-4o-mini")
     st.caption("Streamlit Cloud: add OPENAI_API_KEY in Secrets. Local: you can paste here.")
     st.divider()
     mode = st.radio("Generation mode", ["Quick Mode", "Pipeline Mode"], index=0)
