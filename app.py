@@ -731,13 +731,3 @@ if rows:
         file_name="generated_posts.csv",
         mime="text/csv",
     )
-
-streamlit>=1.32
-pandas>=2.0
-yfinance>=0.2.40
-feedparser>=6.0.11
-python-dotenv>=1.0
-openai>=1.0.0
-requests==2.32.3
-beautifulsoup4==4.12.3
-lxml==5.2.2
