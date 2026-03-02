@@ -3,7 +3,7 @@ import os
 import re
 import random
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # =========================================================
-# API key / client
+# OpenAI key / client
 # =========================================================
 def resolve_api_key(ui_key: str = "") -> str:
     if ui_key and ui_key.strip():
@@ -31,12 +31,12 @@ def resolve_api_key(ui_key: str = "") -> str:
 
 def get_client(api_key: str) -> OpenAI:
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY missing. Add to Streamlit Secrets or paste in sidebar.")
+        raise RuntimeError("OPENAI_API_KEY missing. Add in Streamlit Secrets or paste in sidebar.")
     return OpenAI(api_key=api_key)
 
 
 # =========================================================
-# Small helpers
+# Helpers
 # =========================================================
 def safe_float(x) -> Optional[float]:
     try:
@@ -98,18 +98,18 @@ def truncate(s: str, n: int) -> str:
 
 def ensure_title_body(text: str) -> str:
     """
-    Normalize output to:
+    Ensure output is exactly:
     TITLE: ...
     BODY: ...
-    No extra headings.
+    No extra headers, no bullets enforcement here.
     """
     t = normalize_ws(text)
 
-    # allow RU headings
+    # RU heading normalization
     t = re.sub(r"^(ЗАГОЛОВОК|Заголовок)\s*:\s*", "TITLE: ", t, flags=re.MULTILINE)
     t = re.sub(r"^(ТЕКСТ|Текст)\s*:\s*", "BODY: ", t, flags=re.MULTILINE)
 
-    # remove accidental "Variation" etc
+    # remove accidental "Variation"
     t = re.sub(r"^\s*Variation\s*\d+\s*$", "", t, flags=re.MULTILINE).strip()
 
     if "TITLE:" not in t and "BODY:" not in t:
@@ -127,21 +127,17 @@ def ensure_title_body(text: str) -> str:
         body = "\n".join(lines[1:]).strip()
         return f"TITLE: {title}\n\nBODY: {body}"
 
-    # if BODY exists but TITLE missing
     if "BODY:" in t and "TITLE:" not in t:
         body = t.split("BODY:", 1)[1].strip()
-        title = truncate(body.split("\n")[0].strip(), 90)
+        title = truncate((body.split("\n")[0] if body else "").strip(), 90)
         return f"TITLE: {title}\n\nBODY: {body}"
 
-    # keep only first TITLE/BODY pair if model repeats
+    # keep only first match
     m = re.search(r"(TITLE:\s*.+?\n\nBODY:\s*.+)", t, flags=re.DOTALL)
     return (m.group(1).strip() if m else t.strip())
 
 
 def count_number_anchors(body: str) -> int:
-    """
-    Count numeric anchors in text: digits with optional commas/decimals/%/$
-    """
     if not body:
         return 0
     hits = re.findall(r"(?<!\w)(?:\$?\d[\d,]*(?:\.\d+)?%?)(?!\w)", body)
@@ -169,7 +165,7 @@ def pct_badge_html(chg_pct: Optional[float]) -> str:
 
 
 # =========================================================
-# RSS
+# News: RSS + URL extractor
 # =========================================================
 def stocktitan_rss_url(ticker: str) -> str:
     return f"https://www.stocktitan.net/rss/news/{ticker.strip().upper()}"
@@ -182,16 +178,15 @@ def fetch_news_rss(ticker: str, limit: int = 12) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     for e in getattr(feed, "entries", [])[:limit]:
         items.append(
-            {"title": (e.get("title") or "").strip(),
-             "link": (e.get("link") or "").strip(),
-             "summary": (e.get("summary") or "").strip()}
+            {
+                "title": (e.get("title") or "").strip(),
+                "link": (e.get("link") or "").strip(),
+                "summary": (e.get("summary") or "").strip(),
+            }
         )
     return items
 
 
-# =========================================================
-# URL article fetch (any page)
-# =========================================================
 @st.cache_data(ttl=600)
 def fetch_article(url: str, timeout: int = 12) -> Dict[str, str]:
     url = (url or "").strip()
@@ -207,6 +202,7 @@ def fetch_article(url: str, timeout: int = 12) -> Dict[str, str]:
     title = ""
     if soup.title and soup.title.get_text(strip=True):
         title = soup.title.get_text(strip=True)
+
     ogt = soup.find("meta", property="og:title")
     if ogt and ogt.get("content"):
         title = ogt.get("content").strip() or title
@@ -220,12 +216,7 @@ def fetch_article(url: str, timeout: int = 12) -> Dict[str, str]:
             paras.append(txt)
 
     text = "\n\n".join(paras[:14]).strip()
-
-    return {
-        "url": url,
-        "title": truncate(title, 160),
-        "text": truncate(text, 3800),
-    }
+    return {"url": url, "title": truncate(title, 160), "text": truncate(text, 3800)}
 
 
 # =========================================================
@@ -239,12 +230,15 @@ def fetch_market_data(ticker: str) -> Dict[str, Any]:
     company = ""
     price: Optional[float] = None
     chg_pct: Optional[float] = None
+
     vol: Optional[float] = None
     vol10: Optional[float] = None
     vol3m: Optional[float] = None
+
     shares_out: Optional[float] = None
     market_cap_info: Optional[float] = None
     market_cap_live: Optional[float] = None
+
     prev_close: Optional[float] = None
 
     try:
@@ -296,6 +290,7 @@ def fetch_market_data(ticker: str) -> Dict[str, Any]:
         if hist10 is not None and not hist10.empty:
             vol = float(hist10["Volume"].iloc[-1])
             vol10 = float(hist10["Volume"].tail(10).mean())
+
         hist3 = tk.history(period="3mo", interval="1d")
         if hist3 is not None and not hist3.empty:
             vol3m = float(hist3["Volume"].mean())
@@ -322,16 +317,188 @@ def fetch_market_data(ticker: str) -> Dict[str, Any]:
 
 
 # =========================================================
-# Styles / system prompts (NO boring corporate tone)
+# Persona + Platform dashboard
 # =========================================================
 @dataclass
-class StylePreset:
-    name: str
-    description: str
+class Persona:
+    key: str
+    title: str
+    subtitle: str
+    icon: str
+    accent: str
     system_en: str
     system_ru: str
 
 
+@dataclass
+class Platform:
+    key: str
+    title: str
+    hint: str
+    rules_en: str
+    rules_ru: str
+    default_len: Tuple[int, int]
+
+
+PERSONAS: List[Persona] = [
+    Persona(
+        key="price_action",
+        title="Price Action",
+        subtitle="Technical",
+        icon="📈",
+        accent="#60a5fa",
+        system_en="You are a technical trader. You write tight, market-aware posts with clear logic. Avoid fluff.",
+        system_ru="Ты технарь-трейдер. Пишешь плотно, рыночно, логично. Без воды.",
+    ),
+    Persona(
+        key="deep_tech",
+        title="Deep Tech",
+        subtitle="Technical",
+        icon="🧠",
+        accent="#93c5fd",
+        system_en="You are a deep-tech analyst. Focus on systems, engineering constraints, scalability, and real-world deployment.",
+        system_ru="Ты deep-tech аналитик. Фокус на системах, инженерных ограничениях, масштабировании и внедрении.",
+    ),
+    Persona(
+        key="macro_energy",
+        title="Macro / Energy",
+        subtitle="Macro",
+        icon="📊",
+        accent="#a7f3d0",
+        system_en="You are a macro strategist. Connect geopolitics, commodities, rates, and energy infrastructure into one thesis.",
+        system_ru="Ты макро-стратег. Связываешь геополитику, сырьё, ставки и энергетику в один тезис.",
+    ),
+    Persona(
+        key="value",
+        title="Value Investor",
+        subtitle="Value",
+        icon="💼",
+        accent="#86efac",
+        system_en="You are a value investor. Focus on valuation math, dilution risk, balance sheet and cashflow reality.",
+        system_ru="Ты value-инвестор. Фокус на оценке, риске разводнения, балансе и кэше.",
+    ),
+    Persona(
+        key="algo",
+        title="Algo-Trader",
+        subtitle="Quant",
+        icon="🤖",
+        accent="#67e8f9",
+        system_en="You write like an algo/signal account. Timestamp vibe. Short, technical, objective.",
+        system_ru="Пишешь как сигнал/алго-аккаунт. Коротко, технически, объективно.",
+    ),
+    Persona(
+        key="fomo",
+        title="FOMO Emotion",
+        subtitle="FOMO",
+        icon="🔥",
+        accent="#fb7185",
+        system_en="You write with high urgency and market psychology, but still factual and not promotional.",
+        system_ru="Пишешь с ощущением срочности и психологии толпы, но без агрессивной рекламы и без призывов.",
+    ),
+    Persona(
+        key="journalism",
+        title="Financial Journalism",
+        subtitle="News",
+        icon="📰",
+        accent="#c4b5fd",
+        system_en="You write as a financial journalist: clear, contextual, and neutral. Explain why it matters.",
+        system_ru="Пишешь как финансовый журналист: ясно, контекстно, нейтрально. Объясняешь важность.",
+    ),
+    Persona(
+        key="sellside",
+        title="Sell-Side Analyst",
+        subtitle="Research",
+        icon="🧾",
+        accent="#fbbf24",
+        system_en="You write like sell-side research: structured, execution and catalysts, measurable statements.",
+        system_ru="Пишешь как sell-side ресерч: структурно, катализаторы, измеримые утверждения.",
+    ),
+]
+
+PLATFORMS: List[Platform] = [
+    Platform(
+        key="twitter",
+        title="Twitter / X",
+        hint="Short, punchy. 1–3 sentences. No headings.",
+        rules_en=(
+            "Platform rules: Twitter/X.\n"
+            "- Output MUST be ONLY the post text (no TITLE/BODY labels).\n"
+            "- 1 to 3 sentences.\n"
+            "- No bullet lists.\n"
+            "- If you use numbers, keep them tight.\n"
+            "- Avoid hashtags unless user explicitly allows.\n"
+        ),
+        rules_ru=(
+            "Правила: Twitter/X.\n"
+            "- Вывод ТОЛЬКО текст поста (без TITLE/BODY).\n"
+            "- 1–3 предложения.\n"
+            "- Без списков.\n"
+            "- Хэштеги не использовать (если явно не разрешили).\n"
+        ),
+        default_len=(160, 260),
+    ),
+    Platform(
+        key="reddit",
+        title="Reddit",
+        hint="Slightly longer, conversational, can include 1 short paragraph break.",
+        rules_en=(
+            "Platform rules: Reddit.\n"
+            "- Output MUST be ONLY the post text (no TITLE/BODY labels).\n"
+            "- 2–5 sentences. 1 optional line break.\n"
+            "- No heavy corporate tone.\n"
+        ),
+        rules_ru=(
+            "Правила: Reddit.\n"
+            "- Вывод ТОЛЬКО текст поста (без TITLE/BODY).\n"
+            "- 2–5 предложений. 1 перенос строки можно.\n"
+            "- Без корпоративного тона.\n"
+        ),
+        default_len=(320, 700),
+    ),
+    Platform(
+        key="quora",
+        title="Quora",
+        hint="TITLE + BODY. 1–3 short paragraphs. No bullet lists.",
+        rules_en=(
+            "Platform rules: Quora.\n"
+            "- Output MUST be exactly:\n"
+            "  TITLE: <one line>\n"
+            "  BODY: <1-3 short paragraphs>\n"
+            "- No bullet lists. No extra headings.\n"
+        ),
+        rules_ru=(
+            "Правила: Quora.\n"
+            "- Вывод строго:\n"
+            "  TITLE: <одна строка>\n"
+            "  BODY: <1-3 коротких абзаца>\n"
+            "- Без списков и лишних заголовков.\n"
+        ),
+        default_len=(650, 1200),
+    ),
+    Platform(
+        key="discord",
+        title="Discord",
+        hint="Fast chat message, 1–4 lines, can be more direct.",
+        rules_en=(
+            "Platform rules: Discord.\n"
+            "- Output MUST be ONLY the message text (no TITLE/BODY labels).\n"
+            "- 1–4 lines max.\n"
+            "- No bullet lists.\n"
+        ),
+        rules_ru=(
+            "Правила: Discord.\n"
+            "- Вывод ТОЛЬКО текст сообщения (без TITLE/BODY).\n"
+            "- 1–4 строки.\n"
+            "- Без списков.\n"
+        ),
+        default_len=(180, 420),
+    ),
+]
+
+
+# =========================================================
+# System rules (anti-boring + numbers)
+# =========================================================
 BANNED_PHRASES = [
     "well-positioned",
     "positioned for growth",
@@ -341,76 +508,40 @@ BANNED_PHRASES = [
     "increasing need for",
     "robust",
     "game-changer",
+    "peace of mind",
 ]
 
-CORE_RULES = """
-You generate Quora-style posts. Constraints:
-- Output MUST be exactly:
-  TITLE: <one line>
-  BODY: <text in 1-3 short paragraphs>
-- No bullet lists. No numbering. No headings beyond TITLE/BODY.
-- Sound human, direct, and specific. No press-release tone.
+CORE_RULES_EN = """
+Global rules:
+- Sound human and specific. Avoid press-release language.
 - No buy/sell, no price targets, no "not financial advice".
-- No emojis. No long dashes.
-- MUST connect: news -> why it matters -> why it matters for the ticker.
-- Ticker MUST appear in BODY at least once.
+- No long dashes.
+- Avoid these phrases: {banned}.
+- Must connect: news -> why it matters -> why it matters for the ticker (or for the theme if platform is short).
+- Use numbers when possible. Prefer 2-4 numeric anchors total.
 """.strip()
 
-TITLE_RULES = """
-TITLE rules:
-- Create a UNIQUE title each time.
-- Avoid repeating the same template.
-- 6-14 words. Punchy. Not corporate.
+CORE_RULES_RU = """
+Глобальные правила:
+- Живой, конкретный тон. Без пресс-релиза.
+- Без призывов купить/продать, без таргетов, без "не финсовет".
+- Без длинных тире.
+- Запрещённые фразы: {banned}.
+- Связка: новость -> почему важно -> почему важно для тикера (или темы, если платформа короткая).
+- Цифры: по возможности 2-4 числовых якоря.
 """.strip()
 
-NUMBERS_RULES = """
-Numbers rules:
-- BODY must contain at least 3 numeric anchors (%, $, dates, counts).
-- Prefer: market cap, defense budget size, % of oil flows, % move, volume, etc.
-- If company numbers are missing, use macro numbers provided in input.
-""".strip()
+# Macro anchors: safe “order-of-magnitude” context
+MACRO_ANCHORS = [
+    "~20% of global oil flows through the Strait of Hormuz (order-of-magnitude context).",
+    "U.S. defense spending is ~$850B+ annually (order-of-magnitude context).",
+    "Energy cost swings of ~10-25% can change project payback decisions.",
+]
 
-STYLE_EN_ANALYST = f"""
-{CORE_RULES}
-{TITLE_RULES}
-{NUMBERS_RULES}
-Write in English. Dense, clean, non-hype.
-""".strip()
-
-STYLE_EN_AGGRO = f"""
-{CORE_RULES}
-{TITLE_RULES}
-{NUMBERS_RULES}
-Write in English. More aggressive, more market-aware. Short sentences. Hard claims only if supported by input.
-""".strip()
-
-STYLE_RU_ANALYST = f"""
-{CORE_RULES}
-{TITLE_RULES}
-{NUMBERS_RULES}
-Пиши по-русски. Плотно, конкретно, без канцелярита.
-""".strip()
-
-STYLE_RU_AGGRO = f"""
-{CORE_RULES}
-{TITLE_RULES}
-{NUMBERS_RULES}
-Пиши по-русски. Агрессивнее, ближе к трейдерскому мышлению, но без призывов купить/продать.
-""".strip()
-
-STYLES: List[StylePreset] = [
-    StylePreset(
-        name="Analyst (clean)",
-        description="Плотно, конкретно, без корпоративщины.",
-        system_en=STYLE_EN_ANALYST,
-        system_ru=STYLE_RU_ANALYST,
-    ),
-    StylePreset(
-        name="Aggressive (market-aware)",
-        description="Жёстче, быстрее, больше давления/масштаба.",
-        system_en=STYLE_EN_AGGRO,
-        system_ru=STYLE_RU_AGGRO,
-    ),
+MACRO_ANCHORS_RU = [
+    "Около ~20% мировых потоков нефти проходят через Ормузский пролив (порядок величины).",
+    "Оборонные расходы США порядка ~$850B+ в год (порядок величины).",
+    "Колебания стоимости энергии ~10-25% меняют окупаемость проектов.",
 ]
 
 
@@ -432,7 +563,7 @@ def translate_text(api_key: str, model: str, text: str, target_lang: str) -> str
     sys = (
         "You are a translation engine. Translate ONLY. "
         "Do not rewrite, summarize, add, remove, or change meaning. "
-        "Preserve TITLE/BODY and paragraph breaks exactly. Preserve numbers and tickers."
+        "Preserve numbers and tickers. Preserve line breaks."
     )
     user = f"Translate to {target_lang}. Text:\n\n{text}"
     resp = client.chat.completions.create(
@@ -444,178 +575,335 @@ def translate_text(api_key: str, model: str, text: str, target_lang: str) -> str
 
 
 # =========================================================
-# Prompt builder (forces macro numbers + anti-boring)
+# Prompt builder
 # =========================================================
 def build_prompt(
+    *,
+    lang: str,
+    platform: Platform,
+    persona: Persona,
     ticker: str,
     company_name: str,
     company_one_liner: str,
     market: Dict[str, Any],
+    article: Dict[str, str],
     rss_items: List[Dict[str, str]],
     selected_rss_idx: List[int],
-    article_url: str,
-    article_title: str,
-    article_text: str,
     title_mode: str,
-    tone_seed: int,
-    chars_min: int,
-    chars_max: int,
+    force_numbers: bool,
+    force_ticker_mention: bool,
+    allow_hashtags: bool,
+    char_min: int,
+    char_max: int,
+    variation_seed: int,
 ) -> str:
     t = ticker.strip().upper()
 
-    # Title mode behavior
+    # Title mode (only matters on Quora)
     if title_mode == "mixed":
-        effective = random.choice(["exclude_company", "include_company"])
+        eff = random.choice(["exclude_company", "include_company"])
     else:
-        effective = title_mode
+        eff = title_mode
 
-    if effective == "exclude_company":
-        title_directive = "In TITLE: do NOT mention the company name."
-    else:
-        title_directive = f"In TITLE: you MAY mention the company name ({company_name}) but don't force it."
+    title_directive = ""
+    if platform.key == "quora":
+        if eff == "exclude_company":
+            title_directive = "In TITLE: do NOT mention the company name."
+        else:
+            title_directive = f"In TITLE: you MAY mention the company name ({company_name}) but do not force it."
 
-    # Choose angle each time to avoid same rhythm
+    # Angle bank to avoid same rhythm
     angle = random.choice([
-        "macro oil risk premium and energy volatility",
-        "defense budget and infrastructure procurement",
-        "grid resilience economics and payback math",
-        "why markets reprice small-cap infrastructure fast",
-        "what changes in capital allocation under escalation",
+        "macro risk premium and energy volatility",
+        "defense infrastructure and procurement pressure",
+        "why this changes cost math and payback",
+        "how markets reprice small caps in volatility",
+        "execution relevance vs narrative noise",
+        "commodity-driven electricity impact chain",
     ])
 
-    # Build market anchors (these count as numeric anchors if used)
+    # Market anchors
     anchors = []
     if market.get("mcap_live") is not None:
         anchors.append(f"Market cap (live): {int(market['mcap_live']):,}")
     if market.get("price") is not None:
         anchors.append(f"Last price: {market['price']:.4f}")
     if market.get("chg_pct") is not None:
-        anchors.append(f"Day %: {market['chg_pct']:.2f}%")
+        anchors.append(f"Day change: {market['chg_pct']:.2f}%")
     if market.get("vol") is not None and market.get("vol10") is not None:
         anchors.append(f"Volume: {int(market['vol']):,} vs 10d avg {int(market['vol10']):,}")
 
-    # Macro anchors (fallback if market data is missing)
-    # Keep these stable and safe — they exist to force numeric anchors in text.
-    macro_anchors = [
-        "Macro anchor: ~20% of global oil flows through the Strait of Hormuz.",
-        "Macro anchor: U.S. defense spending is roughly $850B+ annually (order-of-magnitude context).",
-        "Macro anchor: energy cost swings of 10-25% can change project payback decisions.",
-    ]
+    # Article primary context
+    art_title = (article.get("title") or "").strip()
+    art_text = (article.get("text") or "").strip()
+    art_url = (article.get("url") or "").strip()
 
-    # RSS block
+    # RSS secondary context
     rss_sel = [rss_items[i] for i in selected_rss_idx if 0 <= i < len(rss_items)]
     rss_block = []
     if rss_sel:
-        rss_block.append("Selected RSS headlines (secondary context):")
+        rss_block.append("Secondary headlines:")
         for it in rss_sel:
             rss_block.append(f"- {it['title']}")
             if it.get("summary"):
-                rss_block.append(f"  {truncate(strip_html(it['summary']), 240)}")
+                rss_block.append(f"  {truncate(strip_html(it['summary']), 220)}")
 
-    # Article block (primary context)
-    art_block = []
-    if article_url.strip():
-        art_block.append(f"News URL: {article_url.strip()}")
-    if article_title.strip():
-        art_block.append(f"Extracted title: {article_title.strip()}")
-    if article_text.strip():
-        art_block.append("Extracted article text (primary):")
-        art_block.append(truncate(article_text.strip(), 3600))
+    # Macro anchors fallback
+    macro_block = "\n".join(MACRO_ANCHORS if lang == "EN" else MACRO_ANCHORS_RU)
 
-    # Company block
-    comp_block = []
-    if company_one_liner.strip():
-        comp_block.append(f"Company context (use only if relevant): {company_one_liner.strip()}")
+    # Hashtag policy
+    hashtag_rule = ""
+    if platform.key == "twitter":
+        hashtag_rule = "Hashtags: allowed." if allow_hashtags else "Hashtags: do NOT use hashtags."
     else:
-        comp_block.append("Company context: keep minimal. Do not invent products or contracts.")
+        hashtag_rule = "Hashtags: do NOT use hashtags."
 
-    # Anti-boring explicit
-    anti_boring = f"""
-Banned phrases (do not use): {", ".join(BANNED_PHRASES)}.
-Avoid generic filler (no "increasing need", "robust", "pivotal moment").
-Write like a trader-analyst: pressure, scale, numbers, relevance.
-""".strip()
+    # Ticker mention requirement (platform-dependent)
+    ticker_rule = ""
+    if force_ticker_mention:
+        ticker_rule = f"Ticker must appear in output at least once: {t}."
+    else:
+        ticker_rule = f"Prefer mentioning ticker {t} if it fits naturally."
+
+    # Numbers rule
+    numbers_rule = ""
+    if force_numbers:
+        numbers_rule = "Include at least 3 numeric anchors in the output (%, $, dates, counts). Use macro anchors if needed."
+    else:
+        numbers_rule = "Use numbers if they add value; do not force."
+
+    # Language and platform formatting
+    if lang == "EN":
+        core = CORE_RULES_EN.format(banned=", ".join(BANNED_PHRASES))
+        platform_rules = platform.rules_en
+        persona_sys = persona.system_en
+    else:
+        core = CORE_RULES_RU.format(banned=", ".join(BANNED_PHRASES))
+        platform_rules = platform.rules_ru
+        persona_sys = persona.system_ru
+
+    # Build input block
+    input_parts = [
+        f"Ticker: {t}",
+        f"Company name: {company_name}",
+        f"Company one-liner (use only if relevant): {company_one_liner}".strip(),
+        ("Data anchors (use 1-2 max):\n" + "\n".join(anchors)) if anchors else "Data anchors: not available.",
+        f"Macro anchors (use if needed):\n{macro_block}",
+        f"Primary article URL: {art_url}" if art_url else "",
+        f"Primary article title: {art_title}" if art_title else "",
+        f"Primary article text:\n{truncate(art_text, 3400)}" if art_text else "",
+        "\n".join(rss_block) if rss_block else "",
+    ]
 
     hard = f"""
-Hard requirements:
-- BODY must include at least 3 numeric anchors.
-- Mention ticker {t} in BODY at least once.
-- Title uniqueness required.
-- No bullet points.
-- Character target: {chars_min}-{chars_max}.
+Hard constraints:
+- Character target: {char_min}-{char_max}.
 - Angle: {angle}.
-Seed: {tone_seed}.
-{title_directive}
+- Seed: {variation_seed}.
+- {ticker_rule}
+- {numbers_rule}
+- {hashtag_rule}
+- {title_directive}
 """.strip()
 
-    parts = [
-        f"Ticker: {t}",
-        f"Company name: {company_name}".strip(),
-        "\n".join(comp_block),
-        ("Data anchors (use 1-2 max):\n" + "\n".join(anchors)) if anchors else "",
-        ("Macro anchors (use if needed):\n" + "\n".join(macro_anchors)),
-        "\n".join(art_block),
-        "\n".join(rss_block),
-        anti_boring,
-        hard,
-    ]
-    return "\n\n".join([p for p in parts if p and p.strip()])
+    # Prompt
+    return "\n\n".join([x for x in [persona_sys, core, platform_rules, "\n".join([p for p in input_parts if p.strip()]), hard] if x and x.strip()])
 
 
-def postprocess(text: str, ticker: str) -> str:
-    """
-    Enforce:
-    - TITLE/BODY only
-    - remove banned phrases
-    - ensure numeric anchors count >= 3 (retry should handle, but we check)
-    """
-    t = ensure_title_body(clean_no_long_dashes(text))
+def postprocess_output(
+    raw: str,
+    *,
+    platform: Platform,
+    ticker: str,
+    force_numbers: bool,
+    force_ticker_mention: bool,
+) -> str:
+    s = clean_no_long_dashes(raw)
 
-    # remove banned phrases if model slips (soft)
+    # remove banned phrases softly
     for ph in BANNED_PHRASES:
-        t = re.sub(re.escape(ph), "", t, flags=re.IGNORECASE)
+        s = re.sub(re.escape(ph), "", s, flags=re.IGNORECASE)
 
-    # ensure ticker exists in BODY
-    tick = ticker.strip().upper()
-    if "BODY:" in t:
-        title, body = t.split("BODY:", 1)
-        body_clean = body.strip()
-        if tick not in body_clean:
-            body_clean = f"{body_clean}\n\n{tick}"
-        t = title.strip() + "\n\nBODY: " + body_clean
+    t = ticker.strip().upper()
 
-        # ensure numeric anchors >=3; if not, append minimal numeric line
-        if count_number_anchors(body_clean) < 3:
-            body_clean += "\n\n20% oil flow. $850B defense spend. 10-25% power cost swings."
-            t = title.strip() + "\n\nBODY: " + body_clean
+    if platform.key == "quora":
+        s = ensure_title_body(s)
 
-    return t.strip()
+        # enforce ticker mention in BODY
+        if force_ticker_mention and "BODY:" in s:
+            pre, body = s.split("BODY:", 1)
+            body = body.strip()
+            if t not in body:
+                body = f"{body}\n\n{t}"
+            s = pre.strip() + "\n\nBODY: " + body
+
+        # enforce numbers minimum
+        if force_numbers and "BODY:" in s:
+            pre, body = s.split("BODY:", 1)
+            body = body.strip()
+            if count_number_anchors(body) < 3:
+                body += "\n\n20% oil flow. $850B defense spend. 10-25% energy swings."
+            s = pre.strip() + "\n\nBODY: " + body
+
+        # anti bullets
+        s = re.sub(r"(?m)^\s*[-•]\s+", "", s)
+
+        return s.strip()
+
+    # Non-quora platforms: strip TITLE/BODY if model produced them
+    s = re.sub(r"(?is)\bTITLE:\s*.*?\n\nBODY:\s*", "", s).strip()
+    s = re.sub(r"(?im)^\s*(TITLE|BODY)\s*:\s*", "", s).strip()
+
+    if force_ticker_mention and t not in s:
+        # add ticker minimally
+        s = (s + f" {t}").strip()
+
+    if force_numbers and count_number_anchors(s) < 3:
+        s = s.strip()
+        # append minimal numeric anchors without making it weird
+        s += " (20% oil flow, $850B defense spend, 10-25% energy swings)"
+    return s.strip()
 
 
 # =========================================================
-# UI
+# UI: Layout + “cards”
 # =========================================================
 st.set_page_config(page_title="Post Studio", page_icon="⚡", layout="wide")
-st.title("⚡ Quora Post Studio (Less boring, numbers forced, unique titles)")
+st.title("⚡ Post Studio: Persona + Platform + News -> Ticker")
 
+CARD_CSS = """
+<style>
+:root{
+  --card-bg: rgba(255,255,255,0.05);
+  --card-border: rgba(255,255,255,0.10);
+  --card-border-active: rgba(34,197,94,0.65);
+  --text-dim: rgba(255,255,255,0.70);
+}
+.card {
+  border: 1px solid var(--card-border);
+  background: var(--card-bg);
+  border-radius: 14px;
+  padding: 14px 14px 12px 14px;
+  min-height: 92px;
+}
+.card.active {
+  border: 2px solid var(--card-border-active);
+}
+.card .top{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin-bottom:6px;
+}
+.card .icon{
+  width:34px;height:34px;border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  font-size:18px;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.10);
+}
+.card .title{ font-weight:800; font-size:14px; line-height:1.1;}
+.card .sub{ color: var(--text-dim); font-size:12px; margin-top:2px;}
+.smallhint{ color: rgba(255,255,255,0.65); font-size:12px; }
+</style>
+"""
+st.markdown(CARD_CSS, unsafe_allow_html=True)
+
+# Sidebar
 with st.sidebar:
     st.header("OpenAI")
     api_key_ui = st.text_input("API Key (optional if Secrets has it)", value="", type="password")
     api_key = resolve_api_key(api_key_ui)
-
     model = st.text_input("Model", value="gpt-4o-mini")
-    temperature = st.slider("Creativity", 0.5, 1.2, 1.02, 0.05)
+    temperature = st.slider("Creativity", 0.55, 1.20, 1.00, 0.05)
 
     st.divider()
-    st.header("Controls")
+    st.header("Output")
     out_lang = st.selectbox("Output languages", ["EN + RU (translation)", "EN only", "RU only"], index=0)
-    style_name = st.selectbox("Style", [s.name for s in STYLES], index=1)
-    title_mode = st.selectbox("Title mode", ["mixed", "exclude_company", "include_company"], index=0)
     n_variations = st.number_input("Variations", min_value=1, max_value=20, value=3, step=1)
-    chars_min, chars_max = st.slider("Length (characters)", 250, 2200, (650, 1100), step=10)
 
-st.subheader("Ticker")
+    st.divider()
+    st.header("Hard constraints")
+    force_ticker_mention = st.toggle("Ticker must be mentioned", value=True)
+    force_numbers = st.toggle("Force numbers (>=3 anchors)", value=True)
+    title_mode = st.selectbox("Title mode (Quora)", ["mixed", "exclude_company", "include_company"], index=0)
+
+    st.divider()
+    st.header("Platform extras")
+    allow_hashtags = st.toggle("Allow hashtags (Twitter only)", value=False)
+
+# =========================================================
+# Persona dashboard
+# =========================================================
+st.subheader("Select Persona")
+
+if "persona_key" not in st.session_state:
+    st.session_state["persona_key"] = "macro_energy"
+
+cols = st.columns(4)
+for i, p in enumerate(PERSONAS):
+    col = cols[i % 4]
+    with col:
+        active = (st.session_state["persona_key"] == p.key)
+        # button
+        if st.button(f"{p.icon} {p.title}", key=f"persona_btn_{p.key}", use_container_width=True):
+            st.session_state["persona_key"] = p.key
+        # card preview
+        card_class = "card active" if active else "card"
+        st.markdown(
+            f"""
+            <div class="{card_class}">
+              <div class="top">
+                <div class="icon">{p.icon}</div>
+                <div>
+                  <div class="title">{p.title}</div>
+                  <div class="sub">{p.subtitle}</div>
+                </div>
+              </div>
+              <div class="smallhint">{p.system_en.split('.')[0].strip()}.</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+persona = next(x for x in PERSONAS if x.key == st.session_state["persona_key"])
+
+st.divider()
+
+# =========================================================
+# Platform selection
+# =========================================================
+st.subheader("Select Platform")
+platform_titles = [f"{pl.title}" for pl in PLATFORMS]
+platform_map = {pl.title: pl for pl in PLATFORMS}
+chosen_title = st.selectbox("Platform", platform_titles, index=2)  # default Quora
+platform = platform_map[chosen_title]
+st.caption(platform.hint)
+
+# set default length by platform unless overridden
+if "len_override" not in st.session_state:
+    st.session_state["len_override"] = False
+
+col_lenA, col_lenB, col_lenC = st.columns([0.35, 0.45, 0.20])
+with col_lenA:
+    st.session_state["len_override"] = st.toggle("Manual length", value=st.session_state["len_override"])
+with col_lenB:
+    if st.session_state["len_override"]:
+        char_min, char_max = st.slider("Length (characters)", 120, 2200, (platform.default_len[0], platform.default_len[1]), step=10)
+    else:
+        char_min, char_max = platform.default_len
+        st.markdown(f"Length: **{char_min}-{char_max} chars** (platform default)")
+with col_lenC:
+    st.markdown("")
+
+st.divider()
+
+# =========================================================
+# Ticker + Market
+# =========================================================
+st.subheader("Ticker & Market Snapshot")
 c1, c2 = st.columns([1.1, 1.2])
+
 with c1:
     ticker = st.text_input("Ticker", value="NXXT")
     if st.button("Fetch Market + RSS", type="primary"):
@@ -637,43 +925,45 @@ with c2:
     company_name = st.text_input("Company name", value=(market.get("company") or "NextNRG").strip())
     company_one_liner = st.text_area(
         "Company one-liner (optional)",
-        value="Distributed energy + microgrid / storage / resilience infrastructure layer.",
-        height=80,
+        value="Distributed energy infrastructure: microgrids, storage, resilience, and localized power optimization.",
+        height=90,
     )
 
 st.divider()
-st.subheader("News input (URL preferred)")
 
-tab_url, tab_rss = st.tabs(["Paste URL", "RSS (optional)"])
+# =========================================================
+# News input: URL + RSS selection
+# =========================================================
+st.subheader("News Context")
+tab_url, tab_rss = st.tabs(["Paste URL (recommended)", "RSS (optional)"])
 
-article_url = ""
-article_title = ""
-article_text = ""
+if "article" not in st.session_state:
+    st.session_state["article"] = {"url": "", "title": "", "text": ""}
 
 with tab_url:
-    article_url = st.text_input("Paste news URL", value="")
-    if st.button("Fetch article text"):
-        if not article_url.strip():
-            st.warning("Paste URL first.")
-        else:
-            try:
-                art = fetch_article(article_url.strip())
-                st.session_state["article"] = art
-                st.success("Fetched.")
-            except Exception as e:
-                st.error(f"Fetch error: {e}")
+    url_in = st.text_input("Paste news URL", value="")
+    colA, colB = st.columns([0.22, 0.78])
+    with colA:
+        if st.button("Fetch Article", type="primary"):
+            if not url_in.strip():
+                st.warning("Paste a URL first.")
+            else:
+                try:
+                    st.session_state["article"] = fetch_article(url_in.strip())
+                    st.success("Fetched.")
+                except Exception as e:
+                    st.error(f"Fetch error: {e}")
+    with colB:
+        st.caption("Tip: URL mode gives the best relevance + less generic output.")
 
-    art = st.session_state.get("article", {"url": "", "title": "", "text": ""})
-    article_title = art.get("title", "")
-    article_text = art.get("text", "")
-
-    if article_title or article_text:
-        st.text_input("Extracted title", value=article_title, disabled=True)
-        st.text_area("Extracted text", value=article_text, height=220)
+    art = st.session_state["article"]
+    if art.get("title") or art.get("text"):
+        st.text_input("Extracted title", value=art.get("title", ""), disabled=True)
+        st.text_area("Extracted text", value=art.get("text", ""), height=200)
 
 with tab_rss:
     if not rss:
-        st.info("Click 'Fetch Market + RSS' first, or use URL mode.")
+        st.info("Click 'Fetch Market + RSS' first, or just use URL mode.")
     else:
         if "selected_rss" not in st.session_state:
             st.session_state["selected_rss"] = list(range(min(2, len(rss))))
@@ -686,63 +976,92 @@ with tab_rss:
         st.session_state["selected_rss"] = new_selected
 
 st.divider()
+
+# =========================================================
+# Generate
+# =========================================================
 st.subheader("Generate")
 
 def generate_posts() -> List[Dict[str, Any]]:
     if not api_key:
         raise RuntimeError("No API key. Add OPENAI_API_KEY in Secrets or paste in sidebar.")
 
-    style = next(s for s in STYLES if s.name == style_name)
-    rows: List[Dict[str, Any]] = []
+    art = st.session_state.get("article", {"url": "", "title": "", "text": ""})
     selected_idx = st.session_state.get("selected_rss", [])
 
-    # If user didn't fetch URL text, still allow RSS-only
+    rows: List[Dict[str, Any]] = []
     for v in range(int(n_variations)):
+        # language base: EN unless RU-only
+        if out_lang == "RU only":
+            lang = "RU"
+        else:
+            lang = "EN"
+
         prompt = build_prompt(
+            lang=lang,
+            platform=platform,
+            persona=persona,
             ticker=ticker,
             company_name=company_name.strip() or "NextNRG",
             company_one_liner=company_one_liner,
             market=market,
+            article=art,
             rss_items=rss,
             selected_rss_idx=selected_idx[:3] if rss else [],
-            article_url=art.get("url", "") if "article" in st.session_state else article_url,
-            article_title=article_title,
-            article_text=article_text,
             title_mode=title_mode,
-            tone_seed=v,
-            chars_min=chars_min,
-            chars_max=chars_max,
+            force_numbers=force_numbers,
+            force_ticker_mention=force_ticker_mention,
+            allow_hashtags=allow_hashtags,
+            char_min=char_min,
+            char_max=char_max,
+            variation_seed=v,
         )
 
-        # Generate base in EN or RU depending on out_lang selection
-        if out_lang == "RU only":
-            sys = style.system_ru
-            base = call_gpt(api_key, model, sys, prompt, temperature=temperature)
-            base = postprocess(base, ticker)
-
-            rows.append({"variation": v + 1, "lang": "RU", "ticker": ticker.strip().upper(), "style": style_name, "text": base})
-
+        # compose system
+        sys = prompt.split("\n\n", 1)[0]  # first chunk is persona_sys inside prompt, but safe
+        # We'll provide a separate system for better control:
+        if lang == "EN":
+            system = persona.system_en + "\n\n" + CORE_RULES_EN.format(banned=", ".join(BANNED_PHRASES)) + "\n\n" + platform.rules_en
         else:
-            sys = style.system_en
-            base = call_gpt(api_key, model, sys, prompt, temperature=temperature)
-            base = postprocess(base, ticker)
+            system = persona.system_ru + "\n\n" + CORE_RULES_RU.format(banned=", ".join(BANNED_PHRASES)) + "\n\n" + platform.rules_ru
 
-            if out_lang == "EN only":
-                rows.append({"variation": v + 1, "lang": "EN", "ticker": ticker.strip().upper(), "style": style_name, "text": base})
-            else:
-                ru = translate_text(api_key, model, base, "Russian")
-                ru = postprocess(ru, ticker)
-                rows.append({"variation": v + 1, "lang": "EN", "ticker": ticker.strip().upper(), "style": style_name, "text": base})
-                rows.append({"variation": v + 1, "lang": "RU", "ticker": ticker.strip().upper(), "style": style_name, "text": ru})
+        # user content: everything after the system pieces
+        user = prompt
+
+        raw = call_gpt(api_key, model, system, user, temperature=temperature)
+        out = postprocess_output(
+            raw,
+            platform=platform,
+            ticker=ticker,
+            force_numbers=force_numbers,
+            force_ticker_mention=force_ticker_mention,
+        )
+
+        # Save row(s)
+        if out_lang == "EN only":
+            rows.append({"variation": v + 1, "lang": "EN", "platform": platform.title, "persona": persona.title, "ticker": ticker.strip().upper(), "text": out})
+        elif out_lang == "RU only":
+            rows.append({"variation": v + 1, "lang": "RU", "platform": platform.title, "persona": persona.title, "ticker": ticker.strip().upper(), "text": out})
+        else:
+            # EN base, RU translation
+            en_text = out if lang == "EN" else translate_text(api_key, model, out, "English")
+            ru_text = translate_text(api_key, model, en_text, "Russian")
+
+            # postprocess translated too (ticker/numbers rules)
+            en_text = postprocess_output(en_text, platform=platform, ticker=ticker, force_numbers=force_numbers, force_ticker_mention=force_ticker_mention)
+            ru_text = postprocess_output(ru_text, platform=platform, ticker=ticker, force_numbers=force_numbers, force_ticker_mention=force_ticker_mention)
+
+            rows.append({"variation": v + 1, "lang": "EN", "platform": platform.title, "persona": persona.title, "ticker": ticker.strip().upper(), "text": en_text})
+            rows.append({"variation": v + 1, "lang": "RU", "platform": platform.title, "persona": persona.title, "ticker": ticker.strip().upper(), "text": ru_text})
 
     return rows
 
 
-if st.button("Generate posts", type="primary"):
+if st.button("Generate Posts", type="primary"):
     try:
         rows = generate_posts()
         st.session_state["generated_rows"] = rows
-        st.success(f"Generated {len(rows)} rows.")
+        st.success(f"Generated {len(rows)} outputs.")
     except Exception as e:
         st.error(str(e))
 
@@ -761,16 +1080,16 @@ if rows:
             L, R = st.columns(2)
             with L:
                 st.markdown("**English**")
-                st.text_area(f"EN v{v}", value=en, height=420)
+                st.text_area(f"EN v{v}", value=en, height=380)
             with R:
                 st.markdown("**Русский (перевод)**")
-                st.text_area(f"RU v{v}", value=ru, height=420)
+                st.text_area(f"RU v{v}", value=ru, height=380)
         elif out_lang == "EN only":
             en = sub[sub["lang"] == "EN"]["text"].values[0]
-            st.text_area(f"EN v{v}", value=en, height=420)
+            st.text_area(f"EN v{v}", value=en, height=300)
         else:
             ru = sub[sub["lang"] == "RU"]["text"].values[0]
-            st.text_area(f"RU v{v}", value=ru, height=420)
+            st.text_area(f"RU v{v}", value=ru, height=300)
 
     st.download_button(
         "Download CSV",
