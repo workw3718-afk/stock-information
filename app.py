@@ -1,24 +1,24 @@
 # app.py
 import os
 import re
+import random
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import streamlit as st
 import pandas as pd
 import yfinance as yf
 import feedparser
+import requests
+from bs4 import BeautifulSoup
 from openai import OpenAI
-
 
 # =============================
 # OpenAI key / client
 # =============================
 def resolve_api_key(ui_key: str = "") -> str:
-    """Priority: UI -> Streamlit Secrets -> ENV"""
     if ui_key and ui_key.strip():
         return ui_key.strip()
-
     try:
         if "OPENAI_API_KEY" in st.secrets:
             v = str(st.secrets["OPENAI_API_KEY"]).strip()
@@ -26,7 +26,6 @@ def resolve_api_key(ui_key: str = "") -> str:
                 return v
     except Exception:
         pass
-
     return (os.getenv("OPENAI_API_KEY", "") or "").strip()
 
 
@@ -48,15 +47,15 @@ def safe_float(x) -> Optional[float]:
         return None
 
 
-def fmt_money(x: Optional[float], d: int = 2) -> str:
+def fmt_money(x: Optional[float], d: int = 4) -> str:
     if x is None:
-        return ""
+        return "—"
     return f"{x:.{d}f}"
 
 
 def fmt_pct(x: Optional[float], d: int = 2) -> str:
     if x is None:
-        return ""
+        return "—"
     sign = "+" if x >= 0 else ""
     return f"{sign}{x:.{d}f}%"
 
@@ -65,20 +64,31 @@ def fmt_big_num(x: Optional[float]) -> str:
     if x is None:
         return "—"
     n = float(x)
-    absn = abs(n)
-    if absn >= 1e12:
+    a = abs(n)
+    if a >= 1e12:
         return f"${n/1e12:.2f}T"
-    if absn >= 1e9:
+    if a >= 1e9:
         return f"${n/1e9:.2f}B"
-    if absn >= 1e6:
+    if a >= 1e6:
         return f"${n/1e6:.2f}M"
-    if absn >= 1e3:
+    if a >= 1e3:
         return f"${n/1e3:.2f}K"
     return f"${n:.0f}"
 
 
+def strip_html(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s or "").strip()
+
+
+def normalize_ws(s: str) -> str:
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
+
+
 def clean_no_long_dashes(s: str) -> str:
-    return (s or "").replace("—", "-")
+    return (s or "").replace("—", "-").replace("–", "-")
 
 
 def truncate(s: str, n: int) -> str:
@@ -86,72 +96,33 @@ def truncate(s: str, n: int) -> str:
     return (s[: n - 1] + "…") if len(s) > n else s
 
 
-def strip_html(s: str) -> str:
-    return re.sub(r"<[^>]+>", "", s or "").strip()
-
-
-def normalize_whitespace(s: str) -> str:
-    s = s.replace("\r\n", "\n").replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s
-
-
-def enforce_title_body_3paras(text: str) -> str:
+def ensure_title_body(text: str) -> str:
     """
-    TITLE: ...
-    BODY: p1
-
-    p2
-
-    p3
+    Ensure output contains TITLE: and BODY:
+    Keep model variability, do NOT force 3 paragraphs.
     """
-    t = normalize_whitespace(text)
-
+    t = normalize_ws(text)
     t = re.sub(r"^(ЗАГОЛОВОК|Заголовок)\s*:\s*", "TITLE: ", t, flags=re.MULTILINE)
     t = re.sub(r"^(ТЕКСТ|Текст)\s*:\s*", "BODY: ", t, flags=re.MULTILINE)
 
-    if "TITLE:" not in t:
+    if "TITLE:" not in t and "BODY:" not in t:
+        # assume first line is title
         lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
-        if lines:
-            title = lines[0]
-            rest = "\n".join(lines[1:]).strip() or title
-            t = f"TITLE: {title}\n\nBODY: {rest}"
-        else:
-            return "TITLE: \n\nBODY: \n\n\n"
+        if not lines:
+            return "TITLE: \n\nBODY: "
+        title = lines[0]
+        body = "\n".join(lines[1:]).strip() or lines[0]
+        return f"TITLE: {title}\n\nBODY: {body}"
 
-    if "BODY:" not in t:
-        parts = t.split("TITLE:", 1)[1].strip()
-        lines = parts.split("\n")
+    if "TITLE:" in t and "BODY:" not in t:
+        # split title from rest
+        after = t.split("TITLE:", 1)[1].strip()
+        lines = after.split("\n")
         title = lines[0].strip()
-        rest = "\n".join(lines[1:]).strip()
-        t = f"TITLE: {title}\n\nBODY: {rest}"
+        body = "\n".join(lines[1:]).strip()
+        return f"TITLE: {title}\n\nBODY: {body}"
 
-    m = re.search(r"TITLE:\s*(.+?)\n+BODY:\s*(.+)$", t, flags=re.DOTALL)
-    if not m:
-        return t
-
-    title = m.group(1).strip()
-    body = m.group(2).strip()
-
-    paras = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
-
-    if len(paras) < 3:
-        sentences = re.split(r"(?<=[.!?])\s+", re.sub(r"\n+", " ", body).strip())
-        sentences = [s.strip() for s in sentences if s.strip()]
-        if len(sentences) >= 6:
-            k = len(sentences)
-            p1 = " ".join(sentences[: k // 3]).strip()
-            p2 = " ".join(sentences[k // 3 : 2 * k // 3]).strip()
-            p3 = " ".join(sentences[2 * k // 3 :]).strip()
-            paras = [p1, p2, p3]
-        else:
-            while len(paras) < 3:
-                paras.append("")
-    elif len(paras) > 3:
-        paras = [paras[0], paras[1], " ".join(paras[2:]).strip()]
-
-    return f"TITLE: {title}\n\nBODY: {paras[0]}\n\n{paras[1]}\n\n{paras[2]}".strip()
+    return t.strip()
 
 
 def pct_badge_html(chg_pct: Optional[float]) -> str:
@@ -198,9 +169,59 @@ def fetch_news_rss(ticker: str, limit: int = 12) -> List[Dict[str, str]]:
 
 
 # =============================
+# Article fetch (any URL)
+# =============================
+@st.cache_data(ttl=600)
+def fetch_article(url: str, timeout: int = 12) -> Dict[str, str]:
+    """
+    Lightweight HTML extraction for a news URL.
+    """
+    url = (url or "").strip()
+    if not url:
+        return {"url": "", "title": "", "text": ""}
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+    }
+    r = requests.get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # title
+    title = ""
+    if soup.title and soup.title.get_text(strip=True):
+        title = soup.title.get_text(strip=True)
+
+    # meta og:title
+    ogt = soup.find("meta", property="og:title")
+    if ogt and ogt.get("content"):
+        title = ogt.get("content").strip() or title
+
+    # main text: grab paragraphs
+    # heuristic: take visible <p> blocks, filter too-short
+    ps = soup.find_all("p")
+    paras = []
+    for p in ps:
+        txt = p.get_text(" ", strip=True)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if len(txt) >= 40:
+            paras.append(txt)
+
+    # reduce boilerplate: keep first ~12 paras max
+    text = "\n\n".join(paras[:12]).strip()
+
+    # final cleanup
+    title = truncate(title, 160)
+    text = truncate(text, 3500)
+
+    return {"url": url, "title": title, "text": text}
+
+
+# =============================
 # Market data
 # =============================
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=45)
 def fetch_market_data(ticker: str) -> Dict[str, Any]:
     t = ticker.strip().upper()
     tk = yf.Ticker(t)
@@ -217,15 +238,16 @@ def fetch_market_data(ticker: str) -> Dict[str, Any]:
     market_cap_info: Optional[float] = None
     market_cap_live: Optional[float] = None
 
+    prev_close: Optional[float] = None
+
     try:
         info = tk.get_info() or {}
         company = str(info.get("longName") or info.get("shortName") or "")[:120]
         shares_out = safe_float(info.get("sharesOutstanding"))
         market_cap_info = safe_float(info.get("marketCap"))
     except Exception:
-        company = ""
+        pass
 
-    prev_close: Optional[float] = None
     try:
         d = tk.history(period="7d", interval="1d")
         if d is not None and not d.empty and len(d) >= 2:
@@ -267,7 +289,6 @@ def fetch_market_data(ticker: str) -> Dict[str, Any]:
         if hist10 is not None and not hist10.empty:
             vol = float(hist10["Volume"].iloc[-1])
             vol10 = float(hist10["Volume"].tail(10).mean())
-
         hist3 = tk.history(period="3mo", interval="1d")
         if hist3 is not None and not hist3.empty:
             vol3m = float(hist3["Volume"].mean())
@@ -294,7 +315,7 @@ def fetch_market_data(ticker: str) -> Dict[str, Any]:
 
 
 # =============================
-# Styles
+# Style presets
 # =============================
 @dataclass
 class StylePreset:
@@ -304,82 +325,62 @@ class StylePreset:
     system_ru: str
 
 
-FORMAT_RULES = """
-OUTPUT FORMAT (MUST MATCH EXACTLY):
-
-TITLE: <one line title>
-
-BODY: <paragraph 1>
-
-<blank line>
-<paragraph 2>
-
-<blank line>
-<paragraph 3>
-
-BODY must be exactly 3 paragraphs separated by one blank line.
+BASE_RULES = """
+Core rules:
+- Write like a real human, not a template.
+- Vary rhythm, sentence length, and structure each time.
+- No emojis. No long dashes.
+- No price targets. No buy/sell. No "financial advice".
+- MUST connect: News -> Why it matters -> Why it matters for the ticker.
+- Ticker must appear in BODY at least once (e.g., NXXT).
 """.strip()
 
-CONTENT_RULES = """
-Content rules:
-- Positive framing only (no warnings, no caution, no downside framing).
-- About 15–25% of the text should include meaningful numbers when available.
-- Do NOT always mention daily price/volume. Use market metrics only if they add value and keep it to one short sentence max.
-- No buy/sell, no price targets, no "financial advice".
-- No emojis. No long dashes.
-- Sound human and specific (avoid generic filler).
+TITLE_VARIATION_RULES = """
+Title rules:
+- Generate a UNIQUE title each time.
+- Avoid repeating patterns like "Positioned for Growth", "Strategic Positioning", etc.
+- If instructed to exclude company name from title, do NOT mention the company name in TITLE.
+- Title should be 6-14 words, punchy, not corporate.
+""".strip()
+
+PARA_RULES = """
+Body structure:
+- Use 1 to 3 paragraphs depending on what fits best.
+- Keep it readable. Prefer dense but clear writing.
+""".strip()
+
+NUMBERS_RULES = """
+Numbers:
+- If numbers are available in the input (market cap, % move, etc.), use 1-2 of them max.
+- Do NOT force numbers if they don't add value.
 """.strip()
 
 STYLES: List[StylePreset] = [
     StylePreset(
-        name="Observant Analyst (Quora DD)",
-        description="Analytical, news-driven, execution-focused (positive only).",
-        system_en=f"""
-You write Quora-style analytical posts in English. Focus on execution, credibility, scale, and strategic positioning.
-{FORMAT_RULES}
-{CONTENT_RULES}
-""".strip(),
-        system_ru=f"""
-Ты пишешь аналитические посты для Quora на русском. Фокус: исполнение, доверие, масштаб, стратегическое позиционирование.
-{FORMAT_RULES}
-{CONTENT_RULES}
-""".strip(),
+        name="Quora Analyst (clean)",
+        description="Analytical, execution-focused, not hype.",
+        system_en=f"You write Quora posts in English.\n{BASE_RULES}\n{TITLE_VARIATION_RULES}\n{PARA_RULES}\n{NUMBERS_RULES}",
+        system_ru=f"Ты пишешь посты для Quora на русском.\n{BASE_RULES}\n{TITLE_VARIATION_RULES}\n{PARA_RULES}\n{NUMBERS_RULES}",
     ),
     StylePreset(
-        name="Growth / Catalysts Lens",
-        description="Growth angle: runway, expansion, measurable scaling (positive only).",
-        system_en=f"""
-You write Quora posts in English with a growth + catalysts lens: runway, scaling, distribution, execution milestones.
-{FORMAT_RULES}
-{CONTENT_RULES}
-""".strip(),
-        system_ru=f"""
-Ты пишешь посты для Quora на русском с фокусом на рост и катализаторы: масштабирование, расширение, этапы исполнения.
-{FORMAT_RULES}
-{CONTENT_RULES}
-""".strip(),
+        name="Macro / Energy Angle",
+        description="Macro -> energy -> infrastructure relevance.",
+        system_en=f"You write Quora posts in English with a macro/energy framing.\n{BASE_RULES}\n{TITLE_VARIATION_RULES}\n{PARA_RULES}\n{NUMBERS_RULES}",
+        system_ru=f"Ты пишешь посты для Quora на русском с макро/энергетическим углом.\n{BASE_RULES}\n{TITLE_VARIATION_RULES}\n{PARA_RULES}\n{NUMBERS_RULES}",
     ),
     StylePreset(
-        name="Institutional Tone (clean)",
-        description="Clean institutional tone, but still readable (positive only).",
-        system_en=f"""
-You write Quora posts in English in a clean institutional tone. Concrete, measured, constructive.
-{FORMAT_RULES}
-{CONTENT_RULES}
-""".strip(),
-        system_ru=f"""
-Ты пишешь посты для Quora на русском в строгом институциональном тоне. Конкретно, без воды, позитивно.
-{FORMAT_RULES}
-{CONTENT_RULES}
-""".strip(),
+        name="Short & Punchy",
+        description="Tighter, faster read, minimal fluff.",
+        system_en=f"You write Quora posts in English.\n{BASE_RULES}\n{TITLE_VARIATION_RULES}\nBody should be 1-2 paragraphs only.\n{NUMBERS_RULES}",
+        system_ru=f"Ты пишешь посты для Quora на русском.\n{BASE_RULES}\n{TITLE_VARIATION_RULES}\nТекст должен быть 1-2 абзаца.\n{NUMBERS_RULES}",
     ),
 ]
 
 
 # =============================
-# OpenAI calls (chat.completions)
+# OpenAI call
 # =============================
-def call_gpt(api_key: str, model: str, system: str, user: str) -> str:
+def call_gpt(api_key: str, model: str, system: str, user: str, temperature: float = 0.9) -> str:
     client = get_client(api_key)
     resp = client.chat.completions.create(
         model=model,
@@ -387,7 +388,7 @@ def call_gpt(api_key: str, model: str, system: str, user: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=0.8,
+        temperature=temperature,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -403,239 +404,329 @@ def translate_text(api_key: str, model: str, text: str, target_lang: str) -> str
     user = f"Translate to {target_lang}. Text:\n\n{text}"
     resp = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": user},
-        ],
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
         temperature=0.2,
     )
     return (resp.choices[0].message.content or "").strip()
 
 
+# =============================
+# Prompt builder
+# =============================
+ANGLE_BANK = [
+    "execution + credibility angle",
+    "macro + oil risk premium angle",
+    "grid resilience + infrastructure angle",
+    "defense procurement relevance angle",
+    "why investors reprice risk angle",
+    "why this changes narrative angle",
+    "what this means for capex cycles angle",
+]
+
+TITLE_MODE_BANK = ["exclude_company", "include_company", "mixed"]
+
 def build_user_prompt(
-    data: Dict[str, Any],
-    headlines: List[Dict[str, str]],
-    selected_idx: List[int],
-    key_catalyst: str,
-    extra_context: str,
     ticker: str,
+    company_name: str,
+    company_one_liner: str,
+    market: Dict[str, Any],
+    rss_items: List[Dict[str, str]],
+    selected_rss_idx: List[int],
+    pasted_news_url: str,
+    pasted_news_text: str,
+    pasted_news_title: str,
+    user_notes: str,
+    include_market_sentence: bool,
+    title_mode: str,
+    positive_only: bool,
+    chars_min: int,
+    chars_max: int,
+    variation_seed: int,
 ) -> str:
-    sel = [headlines[i] for i in selected_idx if 0 <= i < len(headlines)]
-    lines = [f"Ticker: {ticker}"]
+    t = ticker.strip().upper()
+    angle = random.choice(ANGLE_BANK)
 
-    if data.get("company"):
-        lines.append(f"Company: {data.get('company')}")
+    # Title include/exclude directive
+    if title_mode == "mixed":
+        title_mode_effective = random.choice(["exclude_company", "include_company"])
+    else:
+        title_mode_effective = title_mode
 
-    if data.get("price") is not None:
-        lines.append(f"Live Price (optional): ${data.get('price'):.4f}")
-    if data.get("chg_pct") is not None:
-        lines.append(f"Live Change % (optional): {data.get('chg_pct'):.2f}%")
-    if data.get("mcap_live") is not None:
-        lines.append(f"Live Market Cap (optional): {data.get('mcap_live'):.0f}")
+    if title_mode_effective == "exclude_company":
+        title_directive = "TITLE MUST NOT mention the company name. Use only the topic/implication."
+    else:
+        # allow company name sometimes, but not mandatory
+        title_directive = f"TITLE may mention the company name ({company_name}) but do not force it."
 
-    if (
-        data.get("vol") is not None
-        and data.get("vol10") is not None
-        and data.get("vol3m") is not None
-    ):
-        lines.append(
-            f"Volume (optional): {int(data['vol'])} | 10d avg: {int(data['vol10'])} | 3mo avg: {int(data['vol3m'])}"
-        )
+    # sentiment directive
+    if positive_only:
+        sentiment = "Keep framing constructive/positive. Do not include risk warnings or bearish language."
+    else:
+        sentiment = "Balanced tone allowed. You may mention risks briefly, but keep it neutral and not alarmist."
 
-    if key_catalyst.strip():
-        lines.append(f"Key Catalyst (user): {key_catalyst.strip()}")
+    # market sentence optional
+    market_lines = []
+    if include_market_sentence:
+        if market.get("price") is not None:
+            market_lines.append(f"Last price (optional): ${market['price']:.4f}")
+        if market.get("chg_pct") is not None:
+            market_lines.append(f"Day change % (optional): {market['chg_pct']:.2f}%")
+        if market.get("mcap_live") is not None:
+            market_lines.append(f"Market cap (optional): {market['mcap_live']:.0f}")
+        if market.get("vol") is not None and market.get("vol10") is not None:
+            market_lines.append(f"Volume (optional): {int(market['vol'])} vs 10d avg {int(market['vol10'])}")
 
+    # RSS selection
+    rss_block = []
+    sel = [rss_items[i] for i in selected_rss_idx if 0 <= i < len(rss_items)]
     if sel:
-        lines.append("Selected headlines (use as primary context):")
+        rss_block.append("Selected RSS headlines:")
         for it in sel:
-            lines.append(f"- {it['title']}")
+            rss_block.append(f"- {it.get('title','').strip()}")
             if it.get("summary"):
-                lines.append(f"  Summary: {truncate(strip_html(it['summary']), 260)}")
+                rss_block.append(f"  Summary: {truncate(strip_html(it['summary']), 260)}")
             if it.get("link"):
-                lines.append(f"  Link: {it['link']}")
+                rss_block.append(f"  Link: {it['link']}")
 
-    if extra_context.strip():
-        lines.append(f"Additional context: {extra_context.strip()}")
+    # pasted news block
+    pasted_block = []
+    if pasted_news_url.strip():
+        pasted_block.append(f"News URL: {pasted_news_url.strip()}")
+    if pasted_news_title.strip():
+        pasted_block.append(f"Extracted page title: {pasted_news_title.strip()}")
+    if pasted_news_text.strip():
+        pasted_block.append("Extracted article text (primary context):")
+        pasted_block.append(truncate(pasted_news_text.strip(), 3500))
 
-    lines.append("Hard requirement: Output exactly in TITLE/BODY with exactly 3 BODY paragraphs separated by one blank line.")
-    return "\n".join(lines)
+    # company context
+    company_block = []
+    if company_one_liner.strip():
+        company_block.append(f"Company one-liner (use only if relevant): {company_one_liner.strip()}")
+    else:
+        # fallback: allow model to use company name minimally
+        company_block.append("Company context is not provided; keep the company description minimal and tied to the news.")
+
+    # user notes
+    notes_block = []
+    if user_notes.strip():
+        notes_block.append(f"User note / focus: {user_notes.strip()}")
+
+    # hard output requirements
+    hard = f"""
+OUTPUT FORMAT (must match):
+TITLE: <one line>
+BODY: <text>
+No other headers, no bullet lists.
+Character target: {chars_min}-{chars_max}.
+Ticker requirement: BODY must mention {t} at least once.
+{title_directive}
+Write with {angle}.
+{sentiment}
+Seed hint: {variation_seed}
+""".strip()
+
+    pieces = [
+        f"Ticker: {t}",
+        f"Company name: {company_name}".strip(),
+        "\n".join(company_block).strip(),
+        ("\n".join(market_lines)).strip(),
+        ("\n".join(rss_block)).strip(),
+        ("\n".join(pasted_block)).strip(),
+        ("\n".join(notes_block)).strip(),
+        hard,
+    ]
+
+    # remove empties
+    return "\n\n".join([p for p in pieces if p and p.strip()])
 
 
 # =============================
 # UI
 # =============================
 st.set_page_config(page_title="Post Studio", page_icon="⚡", layout="wide")
-st.title("⚡ Quora Post Studio (News + Price + Styles)")
+st.title("⚡ Quora Post Studio (News -> Importance -> Ticker relevance)")
 
 with st.sidebar:
     st.header("OpenAI")
     api_key_ui = st.text_input("API Key (optional if Secrets has it)", value="", type="password")
     api_key = resolve_api_key(api_key_ui)
 
-    # Safer default model for most accounts
     model = st.text_input("Model", value="gpt-4o-mini")
-    st.caption("Streamlit Cloud: add OPENAI_API_KEY in Secrets. Local: you can paste here.")
+    temperature = st.slider("Creativity (temperature)", 0.4, 1.2, 0.95, 0.05)
+
     st.divider()
-    mode = st.radio("Generation mode", ["Quick Mode", "Pipeline Mode"], index=0)
-
-st.subheader("Stock Information")
-cA, cB = st.columns([1.4, 1.0])
-with cA:
-    ticker = st.text_input("Ticker Symbol", value="NXXT")
-with cB:
-    if st.button("Fetch Data", type="primary"):
-        st.session_state["market"] = fetch_market_data(ticker)
-        st.session_state["news"] = fetch_news_rss(ticker, limit=12)
-
-market = st.session_state.get("market", fetch_market_data(ticker))
-news = st.session_state.get("news", [])
-
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Current Price (live)", f"${fmt_money(market.get('price'))}" if market.get("price") is not None else "—")
-
-chg = market.get("chg_pct")
-m2.metric("Price Change (%) (live)", fmt_pct(chg) if chg is not None else "—")
-m2.markdown(pct_badge_html(chg), unsafe_allow_html=True)
-
-vol_text = "—"
-if (market.get("vol") is not None and market.get("vol10") is not None and market.get("vol3m") is not None):
-    vol_text = f"{market['vol']/1e6:.2f}M | 10d: {(market['vol10']/1e6):.2f}M | 3mo: {(market['vol3m']/1e6):.2f}M"
-m3.metric("Volume (vs avg)", vol_text)
-
-mcap_live = market.get("mcap_live")
-m4.metric("Market Cap (live)", fmt_big_num(mcap_live) if mcap_live is not None else "—")
-
-m5.text_input("Company", value=market.get("company", "") or "", disabled=False)
-
-key_catalyst = st.text_input("⚡ Key Catalyst / News", value="", placeholder="e.g., advisory appointment, contract, results...")
-
-with st.expander("Advanced options", expanded=False):
-    extra_context = st.text_area("Additional Context", height=120)
-    base_language = st.selectbox("Base language (generate original)", ["EN", "RU"], index=0)
+    st.header("Output controls")
+    title_mode = st.selectbox("Title mode", ["mixed", "exclude_company", "include_company"], index=0)
+    positive_only = st.toggle("Positive-only framing", value=True)
+    include_market_sentence = st.toggle("Allow 1 short market-data sentence", value=True)
     out_lang = st.selectbox("Output languages", ["EN + RU (translation)", "EN only", "RU only"], index=0)
-    length_hint = st.slider("Length hint (characters)", 300, 2500, (900, 1400), step=10)
-    n_variations = st.number_input("Variations", min_value=1, max_value=10, value=2, step=1)
+    n_variations = st.number_input("Variations", min_value=1, max_value=20, value=3, step=1)
+    chars_min, chars_max = st.slider("Length (characters)", 250, 2200, (700, 1200), step=10)
 
-st.subheader("News Context")
-left, right = st.columns([1.25, 1.0])
+st.subheader("Ticker + Context")
+c1, c2 = st.columns([1.1, 1.2])
+with c1:
+    ticker = st.text_input("Ticker", value="NXXT")
+    market = fetch_market_data(ticker)
 
-with left:
-    if not news:
-        st.info("Click Fetch Data to pull latest headlines automatically (StockTitan RSS).")
+    a, b, c, d = st.columns(4)
+    a.metric("Price", f"${fmt_money(market.get('price'))}" if market.get("price") is not None else "—")
+    chg = market.get("chg_pct")
+    b.metric("Chg %", fmt_pct(chg) if chg is not None else "—")
+    b.markdown(pct_badge_html(chg), unsafe_allow_html=True)
+    c.metric("Mkt Cap", fmt_big_num(market.get("mcap_live")))
+    d.metric("Company", market.get("company") or "—")
+
+with c2:
+    company_name = st.text_input("Company name (for title/body rules)", value=(market.get("company") or "NextNRG").strip())
+    company_one_liner = st.text_area(
+        "Company one-liner (optional, helps relevance)",
+        value="Distributed energy + microgrid / storage / resilience-oriented infrastructure.",
+        height=80,
+    )
+    user_notes = st.text_area(
+        "Your note (optional): what angle do you want this time?",
+        value="Tie the news to energy volatility / defense infrastructure relevance and why this matters for the ticker.",
+        height=80,
+    )
+
+st.divider()
+st.subheader("News input (choose 1: URL OR RSS)")
+
+tab_url, tab_rss = st.tabs(["Paste URL", "StockTitan RSS (optional)"])
+
+pasted_news_url = ""
+pasted_news_title = ""
+pasted_news_text = ""
+
+with tab_url:
+    pasted_news_url = st.text_input("Paste a news URL", value="")
+    if st.button("Fetch article from URL", type="primary"):
+        if not pasted_news_url.strip():
+            st.warning("Paste a URL first.")
+        else:
+            try:
+                art = fetch_article(pasted_news_url.strip())
+                st.session_state["article"] = art
+                st.success("Fetched.")
+            except Exception as e:
+                st.error(f"Fetch error: {e}")
+
+    art = st.session_state.get("article", {"url": "", "title": "", "text": ""})
+    pasted_news_title = art.get("title", "")
+    pasted_news_text = art.get("text", "")
+
+    if pasted_news_title or pasted_news_text:
+        st.markdown("**Extracted preview**")
+        st.text_input("Page title", value=pasted_news_title, disabled=True)
+        st.text_area("Article text", value=pasted_news_text, height=220)
+
+with tab_rss:
+    if st.button("Load RSS headlines"):
+        st.session_state["rss"] = fetch_news_rss(ticker, limit=12)
+
+    rss = st.session_state.get("rss", [])
+    if not rss:
+        st.info("Click 'Load RSS headlines' (optional). If you paste a URL, RSS is not needed.")
+        selected_rss_idx = []
     else:
-        if "selected_news" not in st.session_state:
-            st.session_state["selected_news"] = list(range(min(3, len(news))))
-
-        b1, b2, b3 = st.columns([0.25, 0.25, 0.5])
-        with b1:
-            if st.button("Auto"):
-                st.session_state["selected_news"] = list(range(min(3, len(news))))
-        with b2:
-            if st.button("None"):
-                st.session_state["selected_news"] = []
-        with b3:
-            if st.button("Refresh RSS"):
-                st.session_state["news"] = fetch_news_rss(ticker, limit=12)
-                news = st.session_state["news"]
-
-        selected = set(st.session_state.get("selected_news", []))
+        if "selected_rss" not in st.session_state:
+            st.session_state["selected_rss"] = list(range(min(2, len(rss))))
+        selected = set(st.session_state.get("selected_rss", []))
         new_selected = []
-        for i, it in enumerate(news[:12]):
+        for i, it in enumerate(rss[:12]):
             label = f"{i+1}. {it['title']}"
-            if st.checkbox(label, value=(i in selected), key=f"news_{i}"):
+            if st.checkbox(label, value=(i in selected), key=f"rss_{i}"):
                 new_selected.append(i)
-        st.session_state["selected_news"] = new_selected
-
-with right:
-    st.subheader("Style")
-    style_name = st.selectbox("Choose style", [s.name for s in STYLES], index=0)
-    style = next(s for s in STYLES if s.name == style_name)
-    st.caption(style.description)
-    ads_safe = st.toggle("Ads-safe wording", value=True)
+        st.session_state["selected_rss"] = new_selected
+        selected_rss_idx = new_selected
 
 st.divider()
 st.subheader("Generate")
 
-if st.button("Generate posts", type="primary"):
+def run_generation() -> List[Dict[str, Any]]:
     if not api_key:
-        st.error("No API key. Add OPENAI_API_KEY in Streamlit Cloud Secrets OR paste it in sidebar.")
+        st.error("No API key. Add OPENAI_API_KEY in Streamlit Secrets OR paste it in sidebar.")
         st.stop()
 
-    sel_idx = st.session_state.get("selected_news", [])[:3]
-    user_prompt = build_user_prompt(
-        market,
-        news,
-        sel_idx,
-        key_catalyst,
-        extra_context,
-        ticker.strip().upper(),
-    )
+    rss_items = st.session_state.get("rss", [])
+    selected_idx = st.session_state.get("selected_rss", []) if rss_items else []
 
-    min_len, max_len = length_hint
-
-    pipeline_extra = ""
-    if mode == "Pipeline Mode":
-        pipeline_extra = "\nStrictly comply with the required TITLE/BODY format and EXACTLY 3 BODY paragraphs.\n"
-
-    outputs: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
 
     for v in range(int(n_variations)):
-        var_note = f"\nVariation directive: change phrasing and sentence rhythm. Avoid repeating phrases. Seed hint: {v}\n"
+        prompt = build_user_prompt(
+            ticker=ticker,
+            company_name=company_name.strip() or "NextNRG",
+            company_one_liner=company_one_liner,
+            market=market,
+            rss_items=rss_items,
+            selected_rss_idx=selected_idx[:3],
+            pasted_news_url=pasted_news_url or "",
+            pasted_news_text=pasted_news_text or "",
+            pasted_news_title=pasted_news_title or "",
+            user_notes=user_notes,
+            include_market_sentence=include_market_sentence,
+            title_mode=title_mode,
+            positive_only=positive_only,
+            chars_min=chars_min,
+            chars_max=chars_max,
+            variation_seed=v,
+        )
+
+        style_name = st.session_state.get("style_name", STYLES[0].name)
+        style = next(s for s in STYLES if s.name == style_name)
+
+        # choose base language generation
+        if out_lang == "RU only":
+            sys = style.system_ru
+            lang = "RU"
+        else:
+            sys = style.system_en
+            lang = "EN"
+
+        base = call_gpt(api_key, model, sys, prompt, temperature=temperature)
+        base = clean_no_long_dashes(ensure_title_body(base))
+
+        # enforce ticker in BODY
+        t = ticker.strip().upper()
+        if f" {t}" not in base and f"{t}" not in base:
+            # append minimal if missing
+            base = base.strip() + f"\n\nBODY: {t}"
 
         if out_lang == "EN only":
-            base_language_run = "EN"
+            rows.append({"variation": v + 1, "lang": "EN", "ticker": ticker.strip().upper(), "text": base})
+
         elif out_lang == "RU only":
-            base_language_run = "RU"
+            rows.append({"variation": v + 1, "lang": "RU", "ticker": ticker.strip().upper(), "text": base})
+
         else:
-            base_language_run = base_language
+            # EN base + RU translation
+            en_text = base
+            ru_text = clean_no_long_dashes(translate_text(api_key, model, en_text, "Russian"))
+            ru_text = ensure_title_body(ru_text)
 
-        try:
-            if base_language_run == "EN":
-                sys_base = style.system_en + pipeline_extra
-                user_base = user_prompt + f"\nLanguage: English. Character target: {min_len}-{max_len}.\n" + var_note
+            rows.append({"variation": v + 1, "lang": "EN", "ticker": ticker.strip().upper(), "text": en_text})
+            rows.append({"variation": v + 1, "lang": "RU", "ticker": ticker.strip().upper(), "text": ru_text})
 
-                base_text = clean_no_long_dashes(call_gpt(api_key, model, sys_base, user_base))
-                if ads_safe:
-                    base_text = re.sub(r"\b(BUY|SELL|PRICE TARGET|PT)\b", "", base_text, flags=re.IGNORECASE)
-                base_text = enforce_title_body_3paras(base_text)
+    return rows
 
-                en_text = base_text
-                ru_text = ""
+colA, colB = st.columns([1.1, 1.0])
+with colA:
+    style_name = st.selectbox("Style", [s.name for s in STYLES], index=0)
+    st.session_state["style_name"] = style_name
+    st.caption(next(s for s in STYLES if s.name == style_name).description)
 
-                if out_lang == "EN + RU (translation)":
-                    ru_text = clean_no_long_dashes(translate_text(api_key, model, en_text, "Russian"))
-                    ru_text = enforce_title_body_3paras(ru_text)
+with colB:
+    generate = st.button("Generate posts", type="primary")
 
-            else:
-                sys_base = style.system_ru + pipeline_extra
-                user_base = user_prompt + f"\nLanguage: Russian. Character target: {min_len}-{max_len}.\n" + var_note
-
-                base_text = clean_no_long_dashes(call_gpt(api_key, model, sys_base, user_base))
-                if ads_safe:
-                    base_text = re.sub(r"\b(КУПИТЬ|ПРОДАТЬ|ТАРГЕТ|ЦЕЛЬ ПО ЦЕНЕ)\b", "", base_text, flags=re.IGNORECASE)
-                base_text = enforce_title_body_3paras(base_text)
-
-                ru_text = base_text
-                en_text = ""
-
-                if out_lang == "EN + RU (translation)":
-                    en_text = clean_no_long_dashes(translate_text(api_key, model, ru_text, "English"))
-                    en_text = enforce_title_body_3paras(en_text)
-
-        except Exception as e:
-            st.error(f"OpenAI error: {e}")
-            st.stop()
-
-        if out_lang == "EN only":
-            outputs.append({"variation": v + 1, "lang": "EN", "ticker": ticker.strip().upper(), "style": style_name, "text": en_text})
-        elif out_lang == "RU only":
-            outputs.append({"variation": v + 1, "lang": "RU", "ticker": ticker.strip().upper(), "style": style_name, "text": ru_text})
-        else:
-            outputs.append({"variation": v + 1, "lang": "EN", "ticker": ticker.strip().upper(), "style": style_name, "text": en_text})
-            outputs.append({"variation": v + 1, "lang": "RU", "ticker": ticker.strip().upper(), "style": style_name, "text": ru_text})
-
-    st.session_state["generated_rows"] = outputs
-    st.success(f"Generated {len(outputs)} rows.")
+if generate:
+    try:
+        rows = run_generation()
+        st.session_state["generated_rows"] = rows
+        st.success(f"Generated {len(rows)} rows.")
+    except Exception as e:
+        st.error(f"Error: {e}")
 
 rows = st.session_state.get("generated_rows", [])
 if rows:
@@ -643,19 +734,19 @@ if rows:
     variations = sorted(df["variation"].unique().tolist())
 
     for v in variations:
-        sub = df[df["variation"] == v]
         st.markdown(f"### Variation {v}")
+        sub = df[df["variation"] == v]
 
         if out_lang == "EN + RU (translation)":
             en = sub[sub["lang"] == "EN"]["text"].values[0]
             ru = sub[sub["lang"] == "RU"]["text"].values[0]
-            colL, colR = st.columns(2)
-            with colL:
+            L, R = st.columns(2)
+            with L:
                 st.markdown("**English**")
-                st.text_area(f"EN v{v}", value=en, height=520)
-            with colR:
+                st.text_area(f"EN v{v}", value=en, height=420)
+            with R:
                 st.markdown("**Русский (перевод)**")
-                st.text_area(f"RU v{v}", value=ru, height=520)
+                st.text_area(f"RU v{v}", value=ru, height=420)
         elif out_lang == "EN only":
             en = sub[sub["lang"] == "EN"]["text"].values[0]
             st.text_area(f"EN v{v}", value=en, height=420)
